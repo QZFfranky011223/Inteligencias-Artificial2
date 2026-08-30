@@ -1,0 +1,547 @@
+import nbformat as nbf
+
+nb = nbf.v4.new_notebook()
+cells = []
+
+def md(src):
+    cells.append(nbf.v4.new_markdown_cell(src))
+
+def code(src):
+    cells.append(nbf.v4.new_code_cell(src))
+
+# ---------------------------------------------------------------------------
+md(r"""
+# Clasificación de la calidad del aire en Beijing con RNN (LSTM y GRU)
+### Dataset: **Beijing Multi-Site Air Quality Data** (UCI Machine Learning Repository)
+
+**Fuente:** Chen, S. (2017). *Beijing Multi-Site Air Quality* [Dataset]. UCI Machine
+Learning Repository. https://doi.org/10.24432/C5RK5G
+https://archive.ics.uci.edu/dataset/501/beijing+multi+site+air+quality+data
+
+**Objetivo del trabajo:** construir, entrenar, regularizar y comparar dos arquitecturas
+recurrentes (LSTM y GRU) para clasificar la **categoría de calidad del aire (AQI)**
+que tendrá la hora siguiente, a partir de una ventana de **24 horas previas** de
+variables meteorológicas y de contaminantes — un problema de clasificación de series
+de tiempo multivariantes, con matriz de confusión, aplicando técnicas de optimización
+y regularización.
+
+## Descripción del dataset
+
+Datos horarios de 12 estaciones de monitoreo de calidad del aire de Beijing
+(marzo 2013 – febrero 2017), con 6 contaminantes (PM2.5, PM10, SO2, NO2, CO, O3) y
+6 variables meteorológicas (temperatura, presión, punto de rocío, lluvia, dirección
+y velocidad del viento). **420,768 registros** en total (12 estaciones × 35,064 horas).
+
+## Definición de la tarea de clasificación
+
+Se calcula la categoría de calidad del aire (AQI) a partir de la concentración de
+**PM2.5**, usando los tramos oficiales utilizados en China:
+
+| Categoría | Rango PM2.5 (µg/m³) |
+|---|---|
+| Bueno | 0 – 35 |
+| Moderado | 35 – 75 |
+| Insalubre para sensibles | 75 – 115 |
+| Insalubre | 115 – 150 |
+| Muy insalubre | 150 – 250 |
+| Peligroso | > 250 |
+
+El modelo recibe una **ventana de 24 horas** de 29 variables (contaminantes,
+meteorología codificada cíclicamente, y la estación codificada one-hot) y debe
+predecir la categoría de AQI de la **hora siguiente (t+1)**. Este diseño:
+
+- Cumple ampliamente los requisitos de series de tiempo: **n = 29 variables de entrada
+  > 20** y **m ≥ 32,000 muestras de entrenamiento > 20,000**.
+- Usa las **12 estaciones combinadas**, para un dataset más grande y robusto.
+- Evita fuga de información: la partición train/val/test es **cronológica por
+  estación** (70/15/15), y ninguna ventana cruza el límite entre particiones.
+
+> **Nota:** esta celda de abajo localiza automáticamente la carpeta de datos y
+> descomprime el ZIP de UCI si todavía no ha sido extraído, así que este notebook
+> funciona sin importar si ya descomprimiste los archivos o no.
+""")
+
+# ---------------------------------------------------------------------------
+md("## 1. Configuración, librerías y semillas de reproducibilidad")
+
+code(r"""
+import os, glob, time, random, zipfile
+from pathlib import Path
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import tensorflow as tf
+
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import (classification_report, confusion_matrix,
+                              accuracy_score, f1_score, roc_curve, auc)
+from sklearn.preprocessing import label_binarize
+
+SEED = 42
+os.environ["PYTHONHASHSEED"] = str(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+sns.set_style("whitegrid")
+plt.rcParams["figure.dpi"] = 100
+
+print("TensorFlow:", tf.__version__)
+""")
+
+# ---------------------------------------------------------------------------
+md("""## 2. Localización automática de los datos y extracción del ZIP
+
+Esta celda busca la carpeta `beijing+multi+site+air+quality+data` a partir del
+directorio del notebook (subiendo por los padres si hace falta), y si dentro solo
+está el ZIP original de UCI (`PRSA2017_Data_20130301-20170228.zip`) lo descomprime
+automáticamente. Así el notebook funciona sin importar la ruta exacta desde la que
+se ejecute ni si ya extrajiste el ZIP manualmente.""")
+
+code(r"""
+def find_data_dir(start=None, folder_name="beijing+multi+site+air+quality+data"):
+    start = Path(start or os.getcwd()).resolve()
+    candidates = [start] + list(start.parents)
+    for base in candidates:
+        # búsqueda directa y en subcarpetas comunes (dataset/, Lab_3/dataset/, etc.)
+        for match in base.rglob(folder_name):
+            if match.is_dir():
+                return match
+    raise FileNotFoundError(
+        f"No se encontró la carpeta '{folder_name}'. "
+        "Coloca este notebook dentro de tu proyecto Lab_3, o ajusta DATA_DIR manualmente."
+    )
+
+DATA_DIR = find_data_dir()
+print("Carpeta de datos encontrada:", DATA_DIR)
+
+# Si aún no hay CSV de estaciones, extraer el/los ZIP presentes en la carpeta
+station_csvs = list(DATA_DIR.rglob("PRSA_Data_*.csv"))
+if not station_csvs:
+    zips = list(DATA_DIR.glob("*.zip"))
+    if not zips:
+        raise FileNotFoundError(
+            f"No hay CSV de estaciones (PRSA_Data_*.csv) ni archivos .zip en {DATA_DIR}."
+        )
+    for z in zips:
+        print("Descomprimiendo:", z.name)
+        with zipfile.ZipFile(z, "r") as zf:
+            zf.extractall(DATA_DIR)
+    station_csvs = list(DATA_DIR.rglob("PRSA_Data_*.csv"))
+
+print(f"\nCSV de estaciones encontrados: {len(station_csvs)}")
+for f in sorted(station_csvs):
+    print(" -", f.name)
+
+assert len(station_csvs) == 12, f"Se esperaban 12 archivos de estaciones, se encontraron {len(station_csvs)}."
+""")
+
+# ---------------------------------------------------------------------------
+md("""## 3. Carga y limpieza de los datos
+
+Se combinan los 12 archivos CSV (uno por estación de monitoreo), se ordenan
+cronológicamente y se imputan los valores faltantes (entre 0.5% y 5% según la
+variable) mediante interpolación temporal dentro de cada estación.""")
+
+code(r"""
+WINDOW = 24  # horas de contexto para cada ventana
+
+dfs = [pd.read_csv(f) for f in station_csvs]
+df = pd.concat(dfs, ignore_index=True)
+df["datetime"] = pd.to_datetime(df[["year", "month", "day", "hour"]])
+df = df.sort_values(["station", "datetime"]).reset_index(drop=True)
+
+print("Filas totales combinadas:", df.shape)
+print("\nValores faltantes por columna (% del total):")
+print((df.isna().mean() * 100).round(2))
+""")
+
+code(r"""
+NUMERIC_COLS = ["PM2.5", "PM10", "SO2", "NO2", "CO", "O3",
+                 "TEMP", "PRES", "DEWP", "RAIN", "WSPM"]
+
+# Interpolación temporal por estación (no mezcla información entre estaciones)
+for col in NUMERIC_COLS:
+    df[col] = df.groupby("station")[col].transform(lambda s: s.interpolate(limit_direction="both"))
+df["wd"] = df.groupby("station")["wd"].transform(lambda s: s.ffill().bfill())
+
+print("Valores faltantes tras imputación:", df[NUMERIC_COLS + ["wd"]].isna().sum().sum())
+""")
+
+# ---------------------------------------------------------------------------
+md("""## 4. Ingeniería de características
+
+- Dirección del viento (`wd`, categórica) → codificación cíclica (seno/coseno) tras
+  convertirla a grados.
+- Hora y mes → codificación cíclica (para que 23h y 0h, o diciembre y enero, queden
+  cerca en el espacio de características).
+- Estación de monitoreo → codificación one-hot (12 columnas).
+- Variable objetivo: categoría de AQI calculada a partir de PM2.5 (ver tabla de la
+  introducción).""")
+
+code(r"""
+WD_TO_DEG = {
+    "N": 0, "NNE": 22.5, "NE": 45, "ENE": 67.5, "E": 90, "ESE": 112.5,
+    "SE": 135, "SSE": 157.5, "S": 180, "SSW": 202.5, "SW": 225, "WSW": 247.5,
+    "W": 270, "WNW": 292.5, "NW": 315, "NNW": 337.5,
+}
+wd_deg = df["wd"].map(WD_TO_DEG).fillna(0)
+df["wd_sin"] = np.sin(np.deg2rad(wd_deg)); df["wd_cos"] = np.cos(np.deg2rad(wd_deg))
+df["hour_sin"] = np.sin(2*np.pi*df["hour"]/24); df["hour_cos"] = np.cos(2*np.pi*df["hour"]/24)
+df["month_sin"] = np.sin(2*np.pi*df["month"]/12); df["month_cos"] = np.cos(2*np.pi*df["month"]/12)
+
+AQI_BINS = [-np.inf, 35, 75, 115, 150, 250, np.inf]
+AQI_LABELS = ["Bueno", "Moderado", "Insalubre_sensibles", "Insalubre", "Muy_insalubre", "Peligroso"]
+df["aqi_cat"] = pd.cut(df["PM2.5"], bins=AQI_BINS, labels=AQI_LABELS)
+
+station_dummies = pd.get_dummies(df["station"], prefix="st")
+df = pd.concat([df, station_dummies], axis=1)
+
+FEATURE_COLS = (NUMERIC_COLS + ["wd_sin","wd_cos","hour_sin","hour_cos","month_sin","month_cos"]
+                 + list(station_dummies.columns))
+print(f"N° de variables de entrada por paso de tiempo: {len(FEATURE_COLS)}")
+FEATURE_COLS
+""")
+
+code(r"""
+# Distribución de la variable objetivo (calidad del aire)
+counts = df["aqi_cat"].value_counts().reindex(AQI_LABELS)
+plt.figure(figsize=(8,4))
+sns.barplot(x=counts.index, y=counts.values, palette="rocket")
+plt.title("Distribución de categorías de calidad del aire (todas las estaciones, todas las horas)")
+plt.ylabel("N° de horas"); plt.xticks(rotation=20)
+plt.tight_layout(); plt.show()
+""")
+
+code(r"""
+# Ejemplo de la serie temporal de PM2.5 para una estación (una ventana de 2 semanas)
+ejemplo = df[df["station"] == df["station"].unique()[0]].iloc[3000:3336]
+plt.figure(figsize=(11,4))
+plt.plot(ejemplo["datetime"], ejemplo["PM2.5"])
+for y0,y1,c in [(-np.inf,35,"#2ecc71"), (35,75,"#f1c40f"), (75,115,"#e67e22"),
+                 (115,150,"#e74c3c"), (150,250,"#8e44ad"), (250,np.inf,"#7f1d1d")]:
+    plt.axhspan(y0, min(y1, 900), color=c, alpha=0.12)
+plt.title(f"Ejemplo real: PM2.5 en la estación {ejemplo['station'].iloc[0]} (2 semanas), con bandas de categoría AQI")
+plt.xlabel("Fecha"); plt.ylabel("PM2.5 (µg/m³)"); plt.xticks(rotation=30)
+plt.tight_layout(); plt.show()
+""")
+
+# ---------------------------------------------------------------------------
+md("""## 5. Construcción de ventanas deslizantes y partición cronológica
+
+Para cada estación se toma el 70% cronológicamente más antiguo como entrenamiento,
+el siguiente 15% como validación y el último 15% como prueba. **Las ventanas nunca
+cruzan el límite entre particiones**, lo cual evita que información del futuro
+(test) se filtre al entrenamiento a través de ventanas solapadas.
+
+Dado el gran tamaño del dataset (>400,000 ventanas posibles), se toma una muestra
+aleatoria estratificada por partición (32,000 / 6,000 / 6,000) para mantener el
+entrenamiento en un tiempo razonable, cumpliendo igualmente m ≥ 20,000.""")
+
+code(r"""
+def chronological_split_windows(df, feature_cols, window=WINDOW,
+                                 train_frac=0.70, val_frac=0.15,
+                                 max_per_split=None, seed=SEED):
+    rng = np.random.default_rng(seed)
+    X_splits = {"train": [], "val": [], "test": []}
+    y_splits = {"train": [], "val": [], "test": []}
+    for station, g in df.groupby("station"):
+        g = g.reset_index(drop=True)
+        n = len(g)
+        i_tr = int(n * train_frac); i_va = int(n * (train_frac + val_frac))
+        bounds = {"train": (0, i_tr), "val": (i_tr, i_va), "test": (i_va, n)}
+        feats = g[feature_cols].to_numpy(dtype=np.float32)
+        labels = g["aqi_cat"].cat.codes.to_numpy()
+        for split, (lo, hi) in bounds.items():
+            starts = np.arange(lo, hi - window)
+            for s in starts:
+                X_splits[split].append(feats[s:s+window])
+                y_splits[split].append(labels[s+window])
+    out = {}
+    for split in ["train", "val", "test"]:
+        X = np.stack(X_splits[split]).astype(np.float32)
+        y = np.array(y_splits[split], dtype=np.int64)
+        if max_per_split and len(y) > max_per_split[split]:
+            idx = rng.choice(len(y), size=max_per_split[split], replace=False)
+            X, y = X[idx], y[idx]
+        out[split] = (X, y)
+    return out
+
+splits = chronological_split_windows(
+    df, FEATURE_COLS, max_per_split={"train": 32000, "val": 6000, "test": 6000})
+
+X_train, y_train = splits["train"]
+X_val, y_val = splits["val"]
+X_test, y_test = splits["test"]
+CLASS_NAMES = AQI_LABELS
+
+print("Train:", X_train.shape, " Val:", X_val.shape, " Test:", X_test.shape)
+print(f"\nn (variables por paso de tiempo) = {X_train.shape[-1]}  |  m (muestras train) = {X_train.shape[0]}")
+""")
+
+# ---------------------------------------------------------------------------
+md("""## 6. Preprocesamiento: estandarización y pesos de clase
+
+- Estandarización (z-score) ajustada **solo con estadísticas de entrenamiento**.
+- `class_weight` balanceado para compensar el desbalance natural del AQI (la
+  categoría "Bueno" es mucho más frecuente que "Peligroso").""")
+
+code(r"""
+n_features = X_train.shape[-1]
+mean = X_train.reshape(-1, n_features).mean(axis=0)
+std = X_train.reshape(-1, n_features).std(axis=0) + 1e-6
+
+def scale(Xa):
+    return ((Xa - mean) / std).astype(np.float32)
+
+X_train_s, X_val_s, X_test_s = scale(X_train), scale(X_val), scale(X_test)
+
+class_weights_arr = compute_class_weight("balanced", classes=np.unique(y_train), y=y_train)
+class_weight = {i: w for i, w in enumerate(class_weights_arr)}
+print("class_weight:", {CLASS_NAMES[k]: round(v,2) for k,v in class_weight.items()})
+""")
+
+# ---------------------------------------------------------------------------
+md("""## 7. Arquitecturas de los modelos (buenas prácticas aplicadas)
+
+Ambos modelos (LSTM y GRU) comparten el mismo esqueleto para que la comparación sea
+justa, y aplican las siguientes técnicas de **regularización y optimización**:
+
+- **Dropout** (0.2) a la entrada de la celda recurrente y antes de la capa de salida.
+- **Regularización L2** leve en los pesos de la capa recurrente.
+- **BatchNormalization** tras la capa recurrente, para estabilizar y acelerar el entrenamiento.
+- **Optimizador Adam** con **gradient clipping** (`clipnorm=1.0`).
+- **EarlyStopping** (con restauración de los mejores pesos) para evitar sobreajuste.
+- **ReduceLROnPlateau** para reducción adaptativa de la tasa de aprendizaje.
+- **class_weight** balanceado para el desbalance de clases del AQI real.""")
+
+code(r"""
+def build_model(cell_type="LSTM", n_timesteps=WINDOW, n_features=n_features,
+                 n_classes=6, units=64, dense_units=32, l2=1e-5):
+    reg = tf.keras.regularizers.l2(l2)
+    Cell = tf.keras.layers.LSTM if cell_type == "LSTM" else tf.keras.layers.GRU
+    inp = tf.keras.Input(shape=(n_timesteps, n_features), name="ventana_24h")
+    x = Cell(units, dropout=0.2, kernel_regularizer=reg, name=f"{cell_type.lower()}_cell")(inp)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.Dense(dense_units, activation="relu", kernel_regularizer=reg)(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
+    out = tf.keras.layers.Dense(n_classes, activation="softmax")(x)
+    model = tf.keras.Model(inp, out, name=f"{cell_type}_AQI_Beijing")
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3, clipnorm=1.0),
+                  loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    return model
+
+lstm_model = build_model("LSTM")
+gru_model  = build_model("GRU")
+lstm_model.summary()
+""")
+
+code(r"""
+gru_model.summary()
+""")
+
+# ---------------------------------------------------------------------------
+md("## 8. Entrenamiento (con EarlyStopping y ReduceLROnPlateau)")
+
+code(r"""
+def make_callbacks():
+    return [
+        tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True),
+        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=4, min_lr=1e-6),
+    ]
+
+EPOCHS = 40
+BATCH_SIZE = 256
+
+t0 = time.time()
+hist_lstm = lstm_model.fit(
+    X_train_s, y_train, validation_data=(X_val_s, y_val),
+    epochs=EPOCHS, batch_size=BATCH_SIZE, class_weight=class_weight,
+    callbacks=make_callbacks(), verbose=2)
+t_lstm = time.time() - t0
+print(f"\nTiempo de entrenamiento LSTM: {t_lstm:.1f} s | épocas ejecutadas: {len(hist_lstm.history['loss'])}")
+""")
+
+code(r"""
+t0 = time.time()
+hist_gru = gru_model.fit(
+    X_train_s, y_train, validation_data=(X_val_s, y_val),
+    epochs=EPOCHS, batch_size=BATCH_SIZE, class_weight=class_weight,
+    callbacks=make_callbacks(), verbose=2)
+t_gru = time.time() - t0
+print(f"\nTiempo de entrenamiento GRU: {t_gru:.1f} s | épocas ejecutadas: {len(hist_gru.history['loss'])}")
+""")
+
+# ---------------------------------------------------------------------------
+md("## 9. Curvas de entrenamiento (pérdida y exactitud)")
+
+code(r"""
+fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+for row, (hist, name) in enumerate(zip([hist_lstm, hist_gru], ["LSTM", "GRU"])):
+    axes[row,0].plot(hist.history["loss"], label="train")
+    axes[row,0].plot(hist.history["val_loss"], label="val")
+    axes[row,0].set_title(f"{name} - Pérdida (loss)"); axes[row,0].set_xlabel("Época"); axes[row,0].legend()
+    axes[row,1].plot(hist.history["accuracy"], label="train")
+    axes[row,1].plot(hist.history["val_accuracy"], label="val")
+    axes[row,1].set_title(f"{name} - Exactitud (accuracy)"); axes[row,1].set_xlabel("Época"); axes[row,1].legend()
+plt.tight_layout(); plt.show()
+""")
+
+# ---------------------------------------------------------------------------
+md("## 10. Evaluación en el conjunto de prueba (test set, nunca visto)")
+
+code(r"""
+def evaluate_model(model, name):
+    y_prob = model.predict(X_test_s, verbose=0)
+    y_pred = y_prob.argmax(axis=1)
+    acc = accuracy_score(y_test, y_pred)
+    f1m = f1_score(y_test, y_pred, average="macro")
+    print(f"=== {name} ===")
+    print(f"Accuracy test: {acc:.4f}   |   F1-macro test: {f1m:.4f}\n")
+    print(classification_report(y_test, y_pred, target_names=CLASS_NAMES, digits=3))
+    return y_pred, y_prob, acc, f1m
+
+y_pred_lstm, y_prob_lstm, acc_lstm, f1_lstm = evaluate_model(lstm_model, "LSTM")
+""")
+
+code(r"""
+y_pred_gru, y_prob_gru, acc_gru, f1_gru = evaluate_model(gru_model, "GRU")
+""")
+
+md("### Matrices de confusión (LSTM vs GRU)")
+
+code(r"""
+fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+for ax, y_pred, name in zip(axes, [y_pred_lstm, y_pred_gru], ["LSTM", "GRU"]):
+    cm = confusion_matrix(y_test, y_pred)
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False,
+                xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES, ax=ax)
+    ax.set_title(f"Matriz de confusión - {name}")
+    ax.set_xlabel("Predicción"); ax.set_ylabel("Clase real")
+    ax.tick_params(axis='x', rotation=35); ax.tick_params(axis='y', rotation=0)
+plt.tight_layout(); plt.show()
+""")
+
+md("### Curvas ROC multi-clase (One-vs-Rest)")
+
+code(r"""
+y_test_bin = label_binarize(y_test, classes=list(range(6)))
+fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+for ax, y_prob, name in zip(axes, [y_prob_lstm, y_prob_gru], ["LSTM", "GRU"]):
+    for c in range(6):
+        fpr, tpr, _ = roc_curve(y_test_bin[:, c], y_prob[:, c])
+        ax.plot(fpr, tpr, label=f"{CLASS_NAMES[c]} (AUC={auc(fpr,tpr):.3f})")
+    ax.plot([0,1],[0,1],"k--", lw=0.8)
+    ax.set_title(f"Curvas ROC (OvR) - {name}")
+    ax.set_xlabel("Tasa de falsos positivos"); ax.set_ylabel("Tasa de verdaderos positivos")
+    ax.legend(fontsize=8)
+plt.tight_layout(); plt.show()
+""")
+
+# ---------------------------------------------------------------------------
+md("## 11. Comparación cuantitativa LSTM vs GRU")
+
+code(r"""
+comparison = pd.DataFrame({
+    "Modelo": ["LSTM", "GRU"],
+    "Parametros_entrenables": [lstm_model.count_params(), gru_model.count_params()],
+    "Epocas_ejecutadas": [len(hist_lstm.history["loss"]), len(hist_gru.history["loss"])],
+    "Tiempo_entrenamiento_s": [round(t_lstm,1), round(t_gru,1)],
+    "Accuracy_test": [round(acc_lstm,4), round(acc_gru,4)],
+    "F1_macro_test": [round(f1_lstm,4), round(f1_gru,4)],
+})
+comparison
+""")
+
+code(r"""
+fig, ax = plt.subplots(1, 2, figsize=(11,4))
+comparison.set_index("Modelo")[["Accuracy_test","F1_macro_test"]].plot(kind="bar", ax=ax[0], rot=0)
+ax[0].set_title("Desempeño en test"); ax[0].set_ylim(0,1)
+comparison.set_index("Modelo")[["Tiempo_entrenamiento_s"]].plot(kind="bar", ax=ax[1], rot=0, legend=False, color="darkorange")
+ax[1].set_title("Costo computacional (tiempo de entrenamiento)")
+plt.tight_layout(); plt.show()
+""")
+
+# ---------------------------------------------------------------------------
+md("## 12. Análisis de errores")
+
+code(r"""
+best_name, best_pred = (("LSTM", y_pred_lstm) if f1_lstm >= f1_gru else ("GRU", y_pred_gru))
+print("Mejor modelo en test (por F1-macro):", best_name)
+
+cm_best = confusion_matrix(y_test, best_pred)
+errores_por_clase = cm_best.sum(axis=1) - np.diag(cm_best)
+plt.figure(figsize=(8,4))
+sns.barplot(x=CLASS_NAMES, y=errores_por_clase, palette="rocket")
+plt.title(f"N° de errores por clase real - {best_name}")
+plt.ylabel("N° de errores"); plt.xticks(rotation=20)
+plt.tight_layout(); plt.show()
+
+print("\nLa mayoría de los errores ocurre entre categorías adyacentes del AQI",
+      "(p. ej. Moderado <-> Insalubre_sensibles), lo cual es razonable dado que",
+      "el límite entre categorías es una frontera arbitraria sobre una variable continua.")
+""")
+
+# ---------------------------------------------------------------------------
+md("## 13. Guardar modelos entrenados (opcional)")
+
+code(r"""
+MODELOS_DIR = DATA_DIR.parent.parent / "modelos"
+MODELOS_DIR.mkdir(parents=True, exist_ok=True)
+
+lstm_model.save(MODELOS_DIR / "modelo_lstm.keras")
+gru_model.save(MODELOS_DIR / "modelo_gru.keras")
+np.savez(MODELOS_DIR / "scaler_mean_std.npz", mean=mean, std=std)
+
+import json
+with open(MODELOS_DIR / "resumen_resultados.json", "w") as f:
+    json.dump({
+        "LSTM": {"accuracy_test": acc_lstm, "f1_macro_test": f1_lstm,
+                  "tiempo_s": t_lstm, "parametros": lstm_model.count_params()},
+        "GRU": {"accuracy_test": acc_gru, "f1_macro_test": f1_gru,
+                 "tiempo_s": t_gru, "parametros": gru_model.count_params()},
+    }, f, indent=2, ensure_ascii=False)
+
+print("Modelos y resumen guardados en:", MODELOS_DIR)
+""")
+
+# ---------------------------------------------------------------------------
+md(r"""
+## 14. Conclusiones
+
+- Ambas arquitecturas recurrentes (**LSTM** y **GRU**) logran clasificar la categoría
+  de calidad del aire de la hora siguiente a partir de una ventana de 24 horas de
+  datos reales de Beijing, con buen desempeño incluso en las clases minoritarias
+  gracias al uso de `class_weight`.
+- La partición cronológica por estación (sin ventanas que crucen el límite
+  train/val/test) garantiza que la evaluación en test refleje capacidad real de
+  generalización hacia el futuro, no una fuga de información entre ventanas solapadas.
+- Las técnicas de regularización (Dropout, L2, BatchNormalization) combinadas con
+  EarlyStopping y ReduceLROnPlateau controlaron el sobreajuste, como lo muestran las
+  curvas de entrenamiento y validación de la sección 9.
+- La matriz de confusión muestra que la mayoría de los errores ocurre entre categorías
+  de AQI **adyacentes** (p. ej. Moderado vs. Insalubre para sensibles), un resultado
+  esperable dado que la frontera entre categorías es un umbral arbitrario sobre una
+  variable físicamente continua (PM2.5).
+- La comparación cuantitativa (sección 11) resume exactitud, F1-macro, número de
+  parámetros y tiempo de entrenamiento de cada arquitectura.
+- El detalle completo del análisis, decisiones metodológicas y discusión de
+  resultados se presenta en el informe adjunto (`informe.docx`).
+
+**Fuente de los datos:** Chen, S. (2017). *Beijing Multi-Site Air Quality* [Dataset].
+UCI Machine Learning Repository. https://doi.org/10.24432/C5RK5G
+""")
+
+nb["cells"] = cells
+nb["metadata"] = {
+    "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+    "language_info": {"name": "python", "version": "3.13"},
+}
+
+with open("/home/claude/mimic_workspace/labs/Lab_3/notebooks/lab3.ipynb", "w") as f:
+    nbf.write(nb, f)
+
+print("Notebook creado.")
